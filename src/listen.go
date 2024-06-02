@@ -101,53 +101,49 @@ func Listen(cfg ListenConfig) (err error) {
 		if err != nil {
 			return fmt.Errorf("failed to set deadline (%s)", err)
 		}
-		go handleConn(conn, &cfg, &listenInfo)
+		go handleConn(&conn, &cfg, &listenInfo)
 	}
 }
 
-func handleConn(conn net.Conn, cfg *ListenConfig, listenInfo *listenInfo) {
+func handleConn(conn *net.Conn, cfg *ListenConfig, listenInfo *listenInfo) {
+	defer func() {
+		(*conn).Close()
+		listenInfo.connectionCount--
+	}()
+
 	// check connection limit
 	listenInfo.connectionCount++
 	if listenInfo.connectionCount > cfg.MaxConnections {
 		_ = sendRes(conn, resListenerFull)
-		conn.Close()
-		listenInfo.connectionCount--
 		return
 	}
-
-	defer conn.Close()
 
 	// initialize smtp session
 	s := session{}
 	s.resEhlo = listenInfo.resEhlo
 	s.listenCfg = cfg
-	s.senderAddr = conn.RemoteAddr()
-	s.senderIp = conn.RemoteAddr().(*net.TCPAddr).IP
+	s.senderAddr = (*conn).RemoteAddr()
+	s.senderIp = (*conn).RemoteAddr().(*net.TCPAddr).IP
 	s.fillDefaultVals()
 
 	// greet the client
 	err := sendRes(conn, listenInfo.resGreeting)
 	if err != nil {
 		cfg.LogErrorHandler(fmt.Errorf("failed to greet client: " + err.Error()))
-		listenInfo.connectionCount--
-		conn.Close()
 		return
 	}
 
 	// each packet
 	for {
 		pktBuffer := make([]byte, tcpPktSize)
-		pktSize, err := conn.Read(pktBuffer)
+		pktSize, err := (*conn).Read(pktBuffer)
 		if err != nil {
 			cfg.LogErrorHandler(fmt.Errorf("failed to read packet: " + err.Error()))
-			listenInfo.connectionCount--
 			return
 		}
 		pkt := string(pktBuffer[:pktSize])
-		keepAlive := handlePkt(&conn, cfg, &s, pkt)
+		keepAlive := handlePkt(conn, cfg, &s, pkt)
 		if !keepAlive {
-			conn.Close()
-			listenInfo.connectionCount--
 			return
 		}
 	}
@@ -188,7 +184,7 @@ func handlePkt(conn *net.Conn, cfg *ListenConfig, s *session, pkt string) (keepA
 			} else if cfg.ImplicitTls {
 				response = resTlsAlreadyEnabled
 			} else {
-				err := sendRes(*conn, resConnUpgrade)
+				err := sendRes(conn, resConnUpgrade)
 				if err != nil {
 					cfg.LogErrorHandler(fmt.Errorf("failed to send starttls response: " + err.Error()))
 					return false
@@ -207,7 +203,7 @@ func handlePkt(conn *net.Conn, cfg *ListenConfig, s *session, pkt string) (keepA
 			}
 		}
 
-		err = sendRes(*conn, response)
+		err = sendRes(conn, response)
 		if err != nil {
 			cfg.LogErrorHandler(fmt.Errorf("failed to send response: " + err.Error()))
 			return false
@@ -219,7 +215,7 @@ func handlePkt(conn *net.Conn, cfg *ListenConfig, s *session, pkt string) (keepA
 	return true
 }
 
-func sendRes(conn net.Conn, res response) (err error) {
+func sendRes(conn *net.Conn, res response) (err error) {
 	if !res.respond {
 		return
 	}
@@ -233,7 +229,7 @@ func sendRes(conn net.Conn, res response) (err error) {
 			} else {
 				resMsg = fmt.Sprintf("%d-%s%s", res.statusCode, msg, crlf)
 			}
-			_, err = conn.Write([]byte(resMsg))
+			_, err = (*conn).Write([]byte(resMsg))
 			if err != nil {
 				return
 			}
@@ -241,6 +237,6 @@ func sendRes(conn net.Conn, res response) (err error) {
 		return
 	}
 	resMsg := fmt.Sprintf("%d %s%s", res.statusCode, res.msg, crlf)
-	_, err = conn.Write([]byte(resMsg))
+	_, err = (*conn).Write([]byte(resMsg))
 	return
 }
