@@ -16,7 +16,8 @@ type ListenConfig struct {
 	Domains            []string           // (opt.) rcpt domains to accept for delivery (accept all domains if emtpy)
 	GreetDomain        string             // domain witch will be introduced when smtp starts
 	RequireTls         bool               // if set to true, requires either STARTTLS or implicit TLS for most smtp commands
-	MaxConnections     int                // (opt.) maximum allowed connections (0 = 1000000)
+	MaxConnections     int                // (opt.) maximum allowed connections (0 = 10000)
+	MaxRcpts           int                // (opt.) maximum allows rcpts (0 = 1000)
 	MailHandler        MailHandler        // function to handles mail
 	MailFromSpfHandler MailFromSpfHandler // (opt.) function to handle MAIL FROM spf check
 	LogErrorHandler    LogErrorHandler    // (opt.) function to handle non-fatal errors
@@ -76,7 +77,10 @@ func buildListenInfo(cfg *ListenConfig) (info listenInfo) {
 		info.resEhlo.extendedMsgs = append(info.resEhlo.extendedMsgs, "STARTTLS")
 	}
 	if cfg.MaxConnections < 1 {
-		cfg.MaxConnections = 1000000
+		cfg.MaxConnections = 10_000
+	}
+	if cfg.MaxRcpts < 1 {
+		cfg.MaxRcpts = 1000
 	}
 	return
 }

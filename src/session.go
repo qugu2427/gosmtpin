@@ -198,6 +198,9 @@ func (s *session) handleRcptTo(req string, argsLen int) response {
 		}
 	}
 
+	if len(s.recipients) >= s.listenCfg.MaxRcpts {
+		return resRcptLimitReached
+	}
 	s.recipients = append(s.recipients, email)
 	return resRcptAdded.withMsg("Added recipient " + email)
 }

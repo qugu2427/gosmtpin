@@ -231,4 +231,12 @@ var (
 		"Listener oversaturated",
 		nil,
 	}
+	resRcptLimitReached = response{
+		true,
+		true,
+		false,
+		codeActionAborted,
+		"Recipient limit reached",
+		nil,
+	}
 )

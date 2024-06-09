@@ -22,6 +22,7 @@ func main() {
 		GreetDomain:     "local-host.com",
 		RequireTls:      false,
 		MaxConnections:  3,
+		MaxRcpts:        3,
 		MailHandler:     mailHandler,
 		LogErrorHandler: errHandler,
 	}
