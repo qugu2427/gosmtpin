@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: vps
+    runs-on: self-hosted
     container:
       image: golang:latest # Use the latest Go Docker image
 
