@@ -19,5 +19,8 @@ jobs:
       with:
         go-version: '1.23.4'
 
+    - name: Install dependencies
+      run: go mod tidy
+
     - name: Run tests
-      run: go test -v ./src
+      run: go test ./src -v
