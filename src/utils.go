@@ -6,8 +6,8 @@ import (
 )
 
 var (
-	emailRgx = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]{2,}$`)
-	heloRgx  = regexp.MustCompile(`^[a-zA-Z0-9-\./_]+$`)
+	emailRgx = regexp.MustCompile(`^[^\s@]+@[a-zA-Z0-9-\./_:]+$`)
+	heloRgx  = regexp.MustCompile(`^[a-zA-Z0-9-\./_:]+$`)
 )
 
 func extractAddress(bracketedAddress string) (address string, isValid bool) {

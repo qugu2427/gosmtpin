@@ -1,4 +1,4 @@
-name: Go Test
+name: Unit Test
 
 on:
   push:
@@ -19,5 +19,5 @@ jobs:
       with:
         go-version: '1.23.4'
 
-    - name: Run tests
-      run: go test -v src/*.go
+    - name: Run unit test
+      run: go test -cover -v src/*.go
