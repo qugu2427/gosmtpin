@@ -1,160 +1,98 @@
 package smtpin
 
 import (
+	"fmt"
 	"net"
 	"strings"
 )
 
-/*
-since smtp requests are not sent all at once
-this is basically a struct to keep track of an
-in-propgress smtp request
-*/
+type SessionFlag uint8
+
+const (
+	crlf    string = "\r\n"
+	bodyEnd string = "\r\n.\r\n"
+)
+
+const (
+	sessionFlagSaidHello    SessionFlag = 0b10000000
+	sessionFlagExtended     SessionFlag = 0b01000000
+	sessionFlagBodyStarted  SessionFlag = 0b00100000
+	sessionFlagBodyFinished SessionFlag = 0b00010000
+	sessionFlagTlsEnabled   SessionFlag = 0b00001000
+)
+
 type session struct {
-	senderIp      net.IP
-	senderAddr    net.Addr
-	saidHello     bool
-	extended      bool
-	helloFrom     string
-	mailFrom      string
-	recipients    []string
-	bodyStarted   bool
-	body          string
-	bodyCompleted bool
-	listenCfg     *ListenConfig
-	startedTls    bool // true if STARTTLS has run (NOTE: not true if implicit tls)
-	resEhlo       response
+	flags      SessionFlag
+	helloFrom  string
+	mailFrom   string
+	recipients []string
+	body       string
 }
 
-/*
-returns true if tls is off AND tls is required by the listen cfg
-*/
-func (s *session) needsTls() bool {
-	return s.listenCfg.RequireTls && !(s.listenCfg.ImplicitTls || s.startedTls)
-}
-
-// true is body has started and not terminated
-func (s *session) inBody() bool {
-	return s.bodyStarted && !s.bodyCompleted
-}
-
-func (s *session) fillDefaultVals() {
-	s.saidHello = false
-	s.extended = false
-	s.helloFrom = ""
-	s.mailFrom = ""
-	s.recipients = []string{}
-	s.bodyStarted = false
-	s.body = ""
-	s.bodyCompleted = false
-}
-
-func (s *session) handleReq(req string) response {
-
-	// handle body messages
-	if s.inBody() {
-		return s.handleBody(req)
+func createNewSession() session {
+	return session{
+		0,
+		"",
+		"",
+		nil,
+		"",
 	}
-
-	// translate req into space-seperated args
-	args := argSplit(req)
-	argsLen := len(args)
-	if argsLen == 0 {
-		return resNoop
-	}
-
-	cmd := strings.ToUpper(args[0])
-	if cmd == cmdMail && argsLen > 1 && strings.ToUpper(args[1]) == "FROM" {
-		return s.handleMailFrom(req, argsLen)
-	} else if cmd == cmdRcpt && argsLen > 1 && strings.ToUpper(args[1]) == "TO" {
-		return s.handleRcptTo(req, argsLen)
-	}
-	switch cmd {
-	case cmdEhlo:
-		return s.handleEhlo(args, argsLen)
-	case cmdHelo:
-		return s.handleHelo(args, argsLen)
-	case cmdData:
-		return s.handleData()
-	case cmdQuit:
-		return resBye
-	case cmdRset:
-		s.fillDefaultVals()
-		return resReset
-	case cmdVrfy:
-		return resCmdDisabled // TODO: possible future feature
-	case cmdNoop:
-		return resNoop
-	case cmdTurn:
-		return resCmdObsolete
-	case cmdExpn:
-		return resCmdDisabled // TODO: possible future feature
-	case cmdHelp:
-		return resCmdDisabled // TODO: possible future feature
-	case cmdSend:
-		return resCmdObsolete
-	case cmdSaml:
-		return resCmdObsolete
-	case cmdRelay:
-		return resCmdObsolete
-	case cmdSoml:
-		return resCmdObsolete
-	case cmdTls:
-		return resCmdObsolete
-	case cmdStartTls:
-		return resConnUpgrade
-	case cmdStartSsl:
-		return resCmdObsolete
-	case cmdAuth:
-		return resCmdDisabled
-	}
-	return resUnknownCmd
 }
 
-func (s *session) handleHelo(args []string, argsLen int) response {
-	if s.saidHello {
+func (s *session) hasFlag(flag SessionFlag) bool {
+	return (flag & s.flags) == flag
+}
+
+func (s *session) addFlag(flag SessionFlag) {
+	s.flags |= flag
+}
+
+func (s *session) isInBody() bool {
+	return s.hasFlag(sessionFlagBodyStarted) && !s.hasFlag(sessionFlagBodyFinished)
+}
+
+func (s *session) handleHelo(domain string) (res response) {
+	if s.hasFlag(sessionFlagSaidHello) {
 		return resInvalidSequence
 	}
-	if argsLen != 2 || args[1] == "" {
-		return resInvalidArgNum
+	if !isValidHelo(domain) {
+		return resSyntaxError
 	}
-	s.helloFrom = strings.TrimSpace(args[1])
-	s.saidHello = true
-	return resHelo.withMsg("Hello " + s.helloFrom)
+	s.helloFrom = domain
+	s.addFlag(sessionFlagSaidHello)
+	return resOk
 }
 
-func (s *session) handleEhlo(args []string, argsLen int) response {
-	s.extended = true
-	if s.saidHello {
+func (s *session) handleEhlo(domain string, maxMsgSize int) (res response) {
+	if s.hasFlag(sessionFlagSaidHello) {
 		return resInvalidSequence
 	}
-	if argsLen != 2 || args[1] == "" {
-		return resInvalidArgNum
+	if !isValidHelo(domain) {
+		return resSyntaxError
 	}
-	s.helloFrom = strings.TrimSpace(args[1])
-	s.saidHello = true
-	return s.resEhlo.withMsg("Hello " + s.helloFrom)
+	s.helloFrom = domain
+	s.addFlag(sessionFlagSaidHello)
+	s.addFlag(sessionFlagExtended)
+	return response{
+		statusCode:   codeOk,
+		msg:          resOk.msg,
+		extendedMsgs: []string{"PIPELINING", "STARTTLS", fmt.Sprintf("SIZE %d", maxMsgSize)},
+	}
 }
 
-func (s *session) handleMailFrom(req string, argsLen int) response {
-	if !s.saidHello || s.mailFrom != "" {
+func (s *session) handleMailFrom(senderIp net.IP, handleSpf SpfHandler, tlsMode ListenerTlsMode, address string) (res response) {
+	if !s.hasFlag(sessionFlagSaidHello) || s.mailFrom != "" {
 		return resInvalidSequence
 	}
-	if s.needsTls() {
-		return resNeedTls
+	if !s.hasFlag(sessionFlagTlsEnabled) && tlsMode == TlsModeStartTls {
+		return resTlsRequired
 	}
-	if argsLen < 3 {
-		return resInvalidArgNum
+	address, isValid := extractAddress(address)
+	if !isValid {
+		return resSyntaxError
 	}
-	emailFound, email := findEmailInLine(req)
-	if !emailFound {
-		return resCantParseAddr
-	}
-
-	if s.listenCfg.MailFromSpfHandler != nil {
-		senderDomain := email[strings.Index(email, "@")+1:]
-		senderIp := net.IP(s.senderIp)
-		fail, err := s.listenCfg.MailFromSpfHandler(senderIp, senderDomain, email)
+	if handleSpf != nil {
+		fail, err := handleSpf(senderIp, address[strings.Index(address, "@"):], address)
 		if err != nil {
 			return resSpfErr
 		}
@@ -162,76 +100,42 @@ func (s *session) handleMailFrom(req string, argsLen int) response {
 			return resSpfFail
 		}
 	}
-
-	s.mailFrom = email
-	return resAcceptingMailFrom.withMsg("Accepting mail from " + s.mailFrom)
+	s.mailFrom = address
+	return resOk
 }
 
-func (s *session) handleRcptTo(req string, argsLen int) response {
-	if !s.saidHello || s.mailFrom == "" {
+func (s *session) handleRcptTo(maxRcpts int, address string) (res response) {
+	if s.mailFrom == "" {
 		return resInvalidSequence
 	}
-	if s.needsTls() {
-		return resNeedTls
+	address, isValid := extractAddress(address)
+	if !isValid {
+		return resSyntaxError
 	}
-	if argsLen < 3 {
-		return resInvalidArgNum
+	if len(s.recipients) >= maxRcpts && maxRcpts >= 0 {
+		return resTooManyRcpts
 	}
-	emailFound, email := findEmailInLine(req)
-	if !emailFound {
-		return resCantParseAddr
-	}
-
-	// check if domain is allowed
-	// (only applies when defined in cfg)
-	if s.listenCfg.Domains != nil && len(s.listenCfg.Domains) > 0 {
-		domain := email[strings.Index(email, "@")+1:]
-		allowed := false
-		for _, allowedDomain := range s.listenCfg.Domains {
-			if domain == allowedDomain {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return resNotLocal
-		}
-	}
-
-	if len(s.recipients) >= s.listenCfg.MaxRcpts {
-		return resRcptLimitReached
-	}
-	s.recipients = append(s.recipients, email)
-	return resRcptAdded.withMsg("Added recipient " + email)
+	s.recipients = append(s.recipients, address)
+	return resOk
 }
 
-func (s *session) handleData() response {
-	if s.bodyStarted || len(s.recipients) == 0 || s.mailFrom == "" || !s.saidHello {
+func (s *session) handleData() (res response) {
+	if len(s.recipients) == 0 || s.hasFlag(sessionFlagBodyStarted) {
 		return resInvalidSequence
 	}
-	if s.needsTls() {
-		return resNeedTls
-	}
-	s.bodyStarted = true
+	s.addFlag(sessionFlagBodyStarted)
 	return resStartMail
 }
 
-func (s *session) handleBody(req string) response {
-	s.body += req
-	if strings.HasSuffix(s.body, bodyEnd) {
-		s.bodyCompleted = true
-		s.body = clipBody(s.body)
-		mail := Mail{
-			s.senderAddr,
-			s.mailFrom,
-			s.body,
-			s.recipients,
+func (s *session) handleBody(maxMsgSize int, msg string) (finished bool, res response) {
+	if msg == "." {
+		s.addFlag(sessionFlagBodyFinished)
+		return true, resOk
+	} else {
+		s.body += msg + crlf
+		if len(s.body) > maxMsgSize {
+			return true, resBodyTooBig
 		}
-		if len(s.body) > s.listenCfg.MaxMsgSize {
-			return resMsgTooBig
-		}
-		s.listenCfg.MailHandler(&mail)
-		return resMailAccepted
+		return false, response{}
 	}
-	return resBlank
 }

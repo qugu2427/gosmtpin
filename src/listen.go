@@ -8,221 +8,240 @@ import (
 	"time"
 )
 
-type ListenConfig struct {
-	TlsConfig          *tls.Config        // (opt.) if emtpy RequireTls must be false
-	ImplicitTls        bool               // whether to start tcp conn over tls (recomended: true)
-	ListenAddr         string             // where to listen (ex: 0.0.0.0:25)
-	MaxMsgSize         int                // max allowed size of email message
-	Domains            []string           // (opt.) rcpt domains to accept for delivery (accept all domains if emtpy)
-	GreetDomain        string             // domain witch will be introduced when smtp starts
-	RequireTls         bool               // if set to true, requires either STARTTLS or implicit TLS for most smtp commands
-	MaxConnections     int                // (opt.) maximum allowed connections (0 = 10000)
-	MaxRcpts           int                // (opt.) maximum allows rcpts (0 = 1000)
-	MailHandler        MailHandler        // function to handles mail
-	MailFromSpfHandler MailFromSpfHandler // (opt.) function to handle MAIL FROM spf check
-	LogErrorHandler    LogErrorHandler    // (opt.) function to handle non-fatal errors
+type ListenerTlsMode uint8
+
+var ConnectionTimeout time.Duration = 5 * 60 * time.Second
+var PrintTraceLogs bool = true
+
+const (
+	TlsModeImplicit         ListenerTlsMode = iota // connection will start over tls (recomended)
+	TlsModeStartTls                                // connection MUST upgrade to tls with STARTTLS command
+	TlsModeStartTlsOptional                        // connection MAY upgrade to tls with STARTTLS command (insecure)
+	TlsModeNone                                    // connection cannot be upgraded to tls
+)
+
+const (
+	prefixHelo     string = "HELO"
+	prefixEhlo     string = "EHLO"
+	prefixMailFrom string = "MAIL FROM:"
+	prefixRcptTo   string = "RCPT TO:"
+	prefixData     string = "DATA"
+	prefixQuit     string = "QUIT"
+	prefixRset     string = "RSET"
+	prefixVrfy     string = "VRFY"
+	prefixNoop     string = "NOOP"
+	prefixTurn     string = "TURN"
+	prefixExpn     string = "EXPN"
+	prefixHelp     string = "HELP"
+	prefixSend     string = "SEND"
+	prefixSaml     string = "SAML"
+	prefixSoml     string = "SOML"
+	prefixTls      string = "TLS"
+	prefixStartTls string = "STARTTLS"
+	prefixStartSsl string = "STARTSSL"
+	prefixRelay    string = "RELAY"
+	prefixAuth     string = "AUTH"
+)
+
+type ErrorHandler = func(err error)
+type SpfHandler = func(senderIp net.IP, senderDomain, senderSender string) (fail bool, err error)
+type MailHandler = func(mail *Mail)
+
+type Mail struct {
+	Helo       string
+	SenderIp   net.IP
+	MailFrom   string
+	Data       string
+	Recipients []string
 }
 
-/*
-locally computed listener info
-which is not defined in the cfg
-*/
-type listenInfo struct {
-	resGreeting     response
-	resEhlo         response
-	connectionCount int
+type Listener struct {
+	TlsMode     ListenerTlsMode // tls mode (recomended: Implicit)
+	TlsConfig   *tls.Config     // (opt.) tls config
+	Host        string          // (ex: 0.0.0.0)
+	Port        uint16          // (ex: 25)
+	MaxRcpts    int             // (opt.) maximum allows rcpts (<0 = infinity)
+	MaxMsgSize  int             // max allowed size of email message
+	HandleError ErrorHandler    // (opt.) handle non fatal errors
+	HandleSpf   SpfHandler      // (opt.) handle spf information from mail from
+	HandleMail  MailHandler     // handle end mail
+	Domain      string          // domain to accept on behalf of
 }
 
-// builds either a tcp or tls net.Listener given cfg
-func buildListener(cfg *ListenConfig) (listener net.Listener, err error) {
-	if cfg.TlsConfig == nil {
-		if cfg.ImplicitTls {
-			err = fmt.Errorf("tls is required, but tls config is nil")
-		} else {
-			listener, err = net.Listen("tcp", cfg.ListenAddr)
-		}
+// builds either a tcp or tls net.Listener
+func (listener *Listener) build() (netListener net.Listener, err error) {
+	if listener.TlsConfig == nil && listener.TlsMode != TlsModeNone {
+		err = fmt.Errorf("tls config must be specified")
+	} else if listener.TlsMode == TlsModeImplicit {
+		netListener, err = tls.Listen("tcp", fmt.Sprintf("%s:%d", listener.Host, listener.Port), listener.TlsConfig)
 	} else {
-		if cfg.ImplicitTls {
-			listener, err = tls.Listen("tcp", cfg.ListenAddr, cfg.TlsConfig)
-		} else {
-			listener, err = net.Listen("tcp", cfg.ListenAddr)
-		}
+		netListener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", listener.Host, listener.Port))
 	}
 	return
 }
 
-// computes local listener info based on cfg
-func buildListenInfo(cfg *ListenConfig) (info listenInfo) {
-	info = listenInfo{}
-	info.resGreeting = response{
-		true,
-		true,
-		false,
-		codeReady,
-		fmt.Sprintf("%s ESMTP Service Ready", cfg.GreetDomain),
-		nil,
-	}
-	info.resEhlo = response{
-		true,
-		true,
-		false,
-		codeOk,
-		"Hello",
-		[]string{
-			"PIPELINING",
-			fmt.Sprintf("SIZE %d", cfg.MaxMsgSize),
-		},
-	}
-	if !cfg.ImplicitTls && cfg.RequireTls {
-		info.resEhlo.extendedMsgs = append(info.resEhlo.extendedMsgs, "STARTTLS")
-	}
-	if cfg.MaxConnections < 1 {
-		cfg.MaxConnections = 10_000
-	}
-	if cfg.MaxRcpts < 1 {
-		cfg.MaxRcpts = 1000
-	}
-	return
-}
-
-func Listen(cfg ListenConfig) (err error) {
-	listener, err := buildListener(&cfg)
+func (listener *Listener) Listen() (err error) {
+	netListener, err := listener.build()
 	if err != nil {
 		return err
 	}
 
-	defer listener.Close()
-
-	listenInfo := buildListenInfo(&cfg)
+	defer netListener.Close()
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := netListener.Accept()
 		if err != nil {
-			cfg.LogErrorHandler(fmt.Errorf("failed to accept connection: " + err.Error()))
+			listener.HandleError(fmt.Errorf("failed to accept connection: %s", err.Error()))
 			continue
 		}
-		err = conn.SetDeadline(time.Now().Add(5 * 60 * time.Second))
+		err = conn.SetDeadline(time.Now().Add(ConnectionTimeout))
 		if err != nil {
 			return fmt.Errorf("failed to set deadline (%s)", err)
 		}
-		go handleConn(&conn, &cfg, &listenInfo)
+		go listener.handleConn(&conn)
 	}
 }
 
-func handleConn(conn *net.Conn, cfg *ListenConfig, listenInfo *listenInfo) {
+func (listener *Listener) handleConn(conn *net.Conn) {
 	defer func() {
+		remoteAddr := (*conn).RemoteAddr().String()
 		(*conn).Close()
-		listenInfo.connectionCount--
+		printTraceLog("%s -- closed connection\n", remoteAddr)
 	}()
 
-	// check connection limit
-	listenInfo.connectionCount++
-	if listenInfo.connectionCount > cfg.MaxConnections {
-		_ = sendRes(conn, resListenerFull)
-		return
-	}
+	printTraceLog("%s -- started connection\n", (*conn).RemoteAddr().String())
 
 	// initialize smtp session
-	s := session{}
-	s.resEhlo = listenInfo.resEhlo
-	s.listenCfg = cfg
-	s.senderAddr = (*conn).RemoteAddr()
-	s.senderIp = (*conn).RemoteAddr().(*net.TCPAddr).IP
-	s.fillDefaultVals()
+	session := createNewSession()
+	if listener.TlsMode == TlsModeImplicit {
+		session.addFlag(sessionFlagTlsEnabled)
+	}
 
 	// greet the client
-	err := sendRes(conn, listenInfo.resGreeting)
+	err := sendRes(conn, response{
+		statusCode:   codeReady,
+		msg:          listener.Domain + " ESMTP SERVICE READY",
+		extendedMsgs: nil,
+	})
 	if err != nil {
-		cfg.LogErrorHandler(fmt.Errorf("failed to greet client: " + err.Error()))
+		listener.HandleError(fmt.Errorf("failed to greet client: %s", err.Error()))
 		return
 	}
 
 	// each packet
+	pktBuffer := make([]byte, 1024)
 	for {
-		pktBuffer := make([]byte, tcpPktSize)
-		pktSize, err := (*conn).Read(pktBuffer)
+		var pktSize int
+		pktSize, err = (*conn).Read(pktBuffer)
 		if err != nil {
-			cfg.LogErrorHandler(fmt.Errorf("failed to read packet: " + err.Error()))
+			listener.HandleError(fmt.Errorf("failed to read packet: %s", err.Error()))
 			return
 		}
 		pkt := string(pktBuffer[:pktSize])
-		keepAlive := handlePkt(conn, cfg, &s, pkt)
-		if !keepAlive {
+		if strings.HasSuffix(pkt, crlf) {
+			msgs := strings.Split(strings.TrimSuffix(pkt, crlf), crlf)
+			for _, msg := range msgs {
+				keepAlive := listener.handleMsg(conn, &session, msg)
+				if !keepAlive {
+					return
+				}
+			}
+		} else {
+			listener.HandleError(fmt.Errorf("packet does not end in crlf"))
 			return
 		}
 	}
 }
 
-/*
-	handle each packet as a string
-
-	this exists to allow for pipelining (i.e each pkt having multiple requests)
-*/
-func handlePkt(conn *net.Conn, cfg *ListenConfig, s *session, pkt string) (keepAlive bool) {
-	var responses []response
-
-	// logic to decide how crlfs should be handled
-	// (pipelining, body, etc.)
-	if s.inBody() {
-		responses = append(responses, s.handleReq(pkt))
-	} else if !strings.HasSuffix(pkt, crlf) {
-		responses = []response{resInvalidCrlf}
+func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string) (keepAlive bool) {
+	var res response
+	printTraceLog("%s -> %#v\n", (*conn).RemoteAddr().String(), msg+crlf)
+	if session.isInBody() {
+		var finished bool
+		finished, res = session.handleBody(listener.MaxMsgSize, msg)
+		if !finished {
+			keepAlive = true
+			return
+		}
+		listener.HandleMail(&Mail{
+			Helo:       session.helloFrom,
+			SenderIp:   (*conn).RemoteAddr().(*net.TCPAddr).IP,
+			MailFrom:   session.mailFrom,
+			Data:       session.body,
+			Recipients: session.recipients,
+		})
 	} else {
-		pkt = strings.TrimSuffix(pkt, crlf)
-		requests := strings.Split(pkt, crlf)
-		for _, request := range requests {
-			responses = append(responses, s.handleReq(request))
-		}
+		res = listener.handleCmd(conn, session, msg)
 	}
-
-	var err error
-	for _, response := range responses {
-		if !response.respond {
-			continue
-		}
-
-		// upgrade connection to tls (STARTTLS request)
-		if response.upgradeToTls {
-			if cfg.TlsConfig == nil {
-				response = resNoTls
-			} else if cfg.ImplicitTls {
-				response = resTlsAlreadyEnabled
-			} else {
-				err := sendRes(conn, resConnUpgrade)
-				if err != nil {
-					cfg.LogErrorHandler(fmt.Errorf("failed to send starttls response: " + err.Error()))
-					return false
-				}
-				tlsConn := tls.Server(*conn, cfg.TlsConfig)
-				err = tlsConn.Handshake()
-				if err != nil {
-					response = resFailedTls
-					cfg.LogErrorHandler(fmt.Errorf("failed to start tls: " + err.Error()))
-					return false
-				}
-				*conn = net.Conn(tlsConn)
-				s.fillDefaultVals()
-				s.startedTls = true
-				response = resBlank
-			}
-		}
-
-		err = sendRes(conn, response)
+	err := sendRes(conn, res)
+	if err != nil {
+		listener.HandleError(fmt.Errorf("failed send response: %s", err.Error()))
+		return
+	}
+	if !res.hasFlag(responseFlagEndConnection) {
+		keepAlive = true
+		return
+	}
+	if res.hasFlag(responseFlagUpgradeToTls) {
+		tlsConn := tls.Server(*conn, listener.TlsConfig)
+		err = tlsConn.Handshake()
 		if err != nil {
-			cfg.LogErrorHandler(fmt.Errorf("failed to send response: " + err.Error()))
-			return false
-		} else if !response.keepAlive {
-			(*conn).Close()
-			return false
+			listener.HandleError(fmt.Errorf("failed starttls handshake: %s", err.Error()))
+			return
 		}
+		*session = createNewSession()
+		*conn = net.Conn(tlsConn)
 	}
-	return true
+	return
+}
+
+func (listener *Listener) handleCmd(conn *net.Conn, session *session, cmd string) (res response) {
+	cmd = strings.ToUpper(cmd)
+	words := strings.Split(cmd, " ")
+	wordsLen := len(words)
+	if strings.HasPrefix(cmd, prefixHelo) && wordsLen > 1 {
+		domain := words[1]
+		return session.handleHelo(domain)
+	} else if strings.HasPrefix(cmd, prefixEhlo) && wordsLen > 1 {
+		domain := words[1]
+		return session.handleEhlo(domain, listener.MaxMsgSize)
+	} else if strings.HasPrefix(cmd, prefixMailFrom) && wordsLen > 1 {
+		cmdArgsMsg := strings.TrimSpace(strings.TrimPrefix(cmd, prefixMailFrom))
+		cmdArgs := strings.Split(cmdArgsMsg, " ")
+		address := cmdArgs[0]
+		return session.handleMailFrom((*conn).RemoteAddr().(*net.TCPAddr).IP, listener.HandleSpf, listener.TlsMode, address)
+	} else if strings.HasPrefix(cmd, prefixRcptTo) && wordsLen > 1 {
+		cmdArgsMsg := strings.TrimSpace(strings.TrimPrefix(cmd, prefixRcptTo))
+		cmdArgs := strings.Split(cmdArgsMsg, " ")
+		address := cmdArgs[0]
+		return session.handleRcptTo(int(listener.MaxRcpts), address)
+	} else if strings.HasPrefix(cmd, prefixData) {
+		return session.handleData()
+	} else if strings.HasPrefix(cmd, prefixQuit) {
+		return resBye
+	} else if strings.HasPrefix(cmd, prefixRset) {
+		*session = createNewSession()
+		return resOk
+	} else if strings.HasPrefix(cmd, prefixStartTls) {
+		return resTlsUpgrade
+	} else if strings.HasPrefix(cmd, prefixNoop) {
+		return resOk
+	} else if strings.HasPrefix(cmd, prefixVrfy) ||
+		strings.HasPrefix(cmd, prefixTurn) ||
+		strings.HasPrefix(cmd, prefixExpn) ||
+		strings.HasPrefix(cmd, prefixHelp) ||
+		strings.HasPrefix(cmd, prefixSend) ||
+		strings.HasPrefix(cmd, prefixSaml) ||
+		strings.HasPrefix(cmd, prefixTls) ||
+		strings.HasPrefix(cmd, prefixStartSsl) ||
+		strings.HasPrefix(cmd, prefixRelay) ||
+		strings.HasPrefix(cmd, prefixAuth) {
+		return resNotImplemented
+	}
+	return resSyntaxError
 }
 
 func sendRes(conn *net.Conn, res response) (err error) {
-	if !res.respond {
-		return
-	}
 	if len(res.extendedMsgs) != 0 {
 		msgs := append([]string{res.msg}, res.extendedMsgs...)
 		msgsLen := len(msgs)
@@ -237,10 +256,12 @@ func sendRes(conn *net.Conn, res response) (err error) {
 			if err != nil {
 				return
 			}
+			printTraceLog("%s <- %#v\n", (*conn).RemoteAddr().String(), resMsg)
 		}
 		return
 	}
 	resMsg := fmt.Sprintf("%d %s%s", res.statusCode, res.msg, crlf)
 	_, err = (*conn).Write([]byte(resMsg))
+	printTraceLog("%s <- %#v\n", (*conn).RemoteAddr().String(), resMsg)
 	return
 }

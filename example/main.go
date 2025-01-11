@@ -15,19 +15,20 @@ func main() {
 		fmt.Println("Revieved mail: ", mail)
 	}
 
-	cfg := smtpin.ListenConfig{
-		ImplicitTls:     false,
-		ListenAddr:      "0.0.0.0:25",
-		MaxMsgSize:      10000,
-		GreetDomain:     "local-host.com",
-		RequireTls:      false,
-		MaxConnections:  3,
-		MaxRcpts:        3,
-		MailHandler:     mailHandler,
-		LogErrorHandler: errHandler,
+	listener := smtpin.Listener{
+		TlsMode:     smtpin.TlsModeNone,
+		TlsConfig:   nil,
+		Host:        "0.0.0.0",
+		Port:        25,
+		MaxRcpts:    100,
+		MaxMsgSize:  1024,
+		HandleError: errHandler,
+		HandleMail:  mailHandler,
+		HandleSpf:   nil,
+		Domain:      "localhost",
 	}
 
-	err := smtpin.Listen(cfg)
+	err := listener.Listen()
 	if err != nil {
 		panic(err)
 	}
