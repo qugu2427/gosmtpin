@@ -1,28 +1,23 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
-name: Go
+name: Go Test
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main "]
 
 jobs:
+  test:
+    runs-on: vps
+    container:
+      image: golang:latest # Use the latest Go Docker image
 
-  build:
-    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.23.4'
+    - name: Install dependencies
+      run: go mod tidy
 
-    - name: Build
-      run: go build -v ./src
-
-    - name: Test
+    - name: Run tests
       run: go test -v ./src
