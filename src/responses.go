@@ -38,6 +38,22 @@ func (r response) hasFlag(flag ResponseFlag) bool {
 	return (r.flags & flag) == flag
 }
 
+func (r0 response) equals(r1 response) bool {
+	if len(r0.extendedMsgs) != len(r1.extendedMsgs) {
+		return false
+	}
+
+	for i, r0Msg := range r0.extendedMsgs {
+		if r0Msg != r1.extendedMsgs[i] {
+			return false
+		}
+	}
+
+	return r0.flags == r1.flags &&
+		r0.statusCode == r1.statusCode &&
+		r0.msg == r1.msg
+}
+
 var (
 	resOk = response{
 		0,
