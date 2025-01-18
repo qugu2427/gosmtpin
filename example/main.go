@@ -19,7 +19,7 @@ func main() {
 		TlsMode:     smtpin.TlsModeNone,
 		TlsConfig:   nil,
 		Host:        "0.0.0.0",
-		Port:        25,
+		Port:        2525,
 		MaxRcpts:    100,
 		MaxMsgSize:  1024,
 		HandleError: errHandler,
