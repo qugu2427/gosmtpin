@@ -3,6 +3,7 @@ package smtpin
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 )
 
@@ -19,6 +20,11 @@ const (
 	sessionFlagBodyStarted  SessionFlag = 0b00100000
 	sessionFlagBodyFinished SessionFlag = 0b00010000
 	sessionFlagTlsEnabled   SessionFlag = 0b00001000
+)
+
+var (
+	rgxHelo    *regexp.Regexp = regexp.MustCompile(`^[a-zA-Z0-9-\./_:\[\]\\]{1,255}$`)
+	rgxAddress *regexp.Regexp = regexp.MustCompile(`^[^@]{1,64}@[a-zA-Z0-9-\.]{1,255}$`)
 )
 
 type session struct {
@@ -68,33 +74,37 @@ func (s *session) isInBody() bool {
 	return s.hasFlag(sessionFlagBodyStarted) && !s.hasFlag(sessionFlagBodyFinished)
 }
 
-func (s *session) handleHelo(domain string) (res response) {
+func (s *session) handleHelo(helloFrom string) (res response) {
 	if s.hasFlag(sessionFlagSaidHello) {
 		return resInvalidSequence
 	}
-	if !isValidHelo(domain) {
+	if !rgxHelo.MatchString(helloFrom) {
 		return resSyntaxError
 	}
-	s.helloFrom = domain
+	s.helloFrom = helloFrom
 	s.addFlag(sessionFlagSaidHello)
-	return resOk
+	return resHello
 }
 
-func (s *session) handleEhlo(domain string, maxMsgSize int) (res response) {
+func (s *session) handleEhlo(helloFrom string, maxMsgSize int) (res response) {
 	if s.hasFlag(sessionFlagSaidHello) {
 		return resInvalidSequence
 	}
-	if !isValidHelo(domain) {
+	if !rgxHelo.MatchString(helloFrom) {
 		return resSyntaxError
 	}
-	s.helloFrom = domain
+	s.helloFrom = helloFrom
 	s.addFlag(sessionFlagSaidHello)
 	s.addFlag(sessionFlagExtended)
-	return response{
+	res = response{
 		statusCode:   codeOk,
-		msg:          resOk.msg,
-		extendedMsgs: []string{"PIPELINING", "STARTTLS", fmt.Sprintf("SIZE %d", maxMsgSize)},
+		msg:          resHello.msg,
+		extendedMsgs: []string{"PIPELINING", fmt.Sprintf("SIZE %d", maxMsgSize)},
 	}
+	if !s.hasFlag(sessionFlagTlsEnabled) {
+		res.extendedMsgs = append(res.extendedMsgs, "STARTTLS")
+	}
+	return
 }
 
 func (s *session) handleMailFrom(senderIp net.IP, handleSpf SpfHandler, tlsMode ListenerTlsMode, address string) (res response) {
@@ -104,9 +114,11 @@ func (s *session) handleMailFrom(senderIp net.IP, handleSpf SpfHandler, tlsMode 
 	if !s.hasFlag(sessionFlagTlsEnabled) && tlsMode == TlsModeStartTls {
 		return resTlsRequired
 	}
-	address, isValid := extractAddress(address)
-	if !isValid {
-		return resSyntaxError
+	if address == "" {
+		address = s.helloFrom
+	}
+	if !rgxAddress.MatchString(address) {
+		return resInvalidAddress
 	}
 	if handleSpf != nil {
 		fail, err := handleSpf(senderIp, address[strings.Index(address, "@"):], address)
@@ -125,12 +137,14 @@ func (s *session) handleRcptTo(maxRcpts int, address string) (res response) {
 	if s.mailFrom == "" {
 		return resInvalidSequence
 	}
-	address, isValid := extractAddress(address)
-	if !isValid {
-		return resSyntaxError
+	if !rgxAddress.MatchString(address) && strings.ToLower(address) != "postmaster" {
+		return resInvalidAddress
 	}
 	if len(s.recipients) >= maxRcpts && maxRcpts >= 0 {
 		return resTooManyRcpts
+	}
+	if contains(s.recipients, address) {
+		return resDuplicateRcpt
 	}
 	s.recipients = append(s.recipients, address)
 	return resOk

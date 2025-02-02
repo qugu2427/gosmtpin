@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -21,26 +22,32 @@ const (
 )
 
 const (
-	prefixHelo     string = "HELO"
-	prefixEhlo     string = "EHLO"
-	prefixMailFrom string = "MAIL FROM:"
-	prefixRcptTo   string = "RCPT TO:"
-	prefixData     string = "DATA"
-	prefixQuit     string = "QUIT"
-	prefixRset     string = "RSET"
-	prefixVrfy     string = "VRFY"
-	prefixNoop     string = "NOOP"
-	prefixTurn     string = "TURN"
-	prefixExpn     string = "EXPN"
-	prefixHelp     string = "HELP"
-	prefixSend     string = "SEND"
-	prefixSaml     string = "SAML"
-	prefixSoml     string = "SOML"
-	prefixTls      string = "TLS"
-	prefixStartTls string = "STARTTLS"
-	prefixStartSsl string = "STARTSSL"
-	prefixRelay    string = "RELAY"
-	prefixAuth     string = "AUTH"
+	verbHelo     string = "HELO"
+	verbEhlo     string = "EHLO"
+	verbMail     string = "MAIL"
+	verbRcpt     string = "RCPT"
+	verbData     string = "DATA"
+	verbQuit     string = "QUIT"
+	verbRset     string = "RSET"
+	verbVrfy     string = "VRFY"
+	verbNoop     string = "NOOP"
+	verbTurn     string = "TURN"
+	verbExpn     string = "EXPN"
+	verbHelp     string = "HELP"
+	verbSend     string = "SEND"
+	verbSaml     string = "SAML"
+	verbSoml     string = "SOML"
+	verbTls      string = "TLS"
+	verbStartTls string = "STARTTLS"
+	verbStartSsl string = "STARTSSL"
+	verbRelay    string = "RELAY"
+	verbAuth     string = "AUTH"
+)
+
+var (
+	rgxMailFrom *regexp.Regexp = regexp.MustCompile(`(?i)^MAIL FROM: ?<[^<>]*>( <[^<>]+>)*$`)
+	rgxRcptTo   *regexp.Regexp = regexp.MustCompile(`(?i)^RCPT TO: ?<[^<>]+>( <[^<>]+>)*$`)
+	rgxBrktTxt  *regexp.Regexp = regexp.MustCompile(`<[^<>]*>`)
 )
 
 type ErrorHandler = func(err error)
@@ -62,7 +69,7 @@ type Listener struct {
 	Port        uint16          // (ex: 25)
 	MaxRcpts    int             // (opt.) maximum allows rcpts (<0 = infinity)
 	MaxMsgSize  int             // max allowed size of email message
-	HandleError ErrorHandler    // (opt.) handle non fatal errors
+	HandleError ErrorHandler    // handle non fatal errors
 	HandleSpf   SpfHandler      // (opt.) handle spf information from mail from
 	HandleMail  MailHandler     // handle end mail
 	Domain      string          // domain to accept on behalf of
@@ -93,10 +100,6 @@ func (listener *Listener) Listen() (err error) {
 		if err != nil {
 			listener.HandleError(fmt.Errorf("failed to accept connection: %s", err.Error()))
 			continue
-		}
-		err = conn.SetDeadline(time.Now().Add(ConnectionTimeout))
-		if err != nil {
-			return fmt.Errorf("failed to set deadline (%s)", err)
 		}
 		go listener.handleConn(&conn)
 	}
@@ -132,6 +135,7 @@ func (listener *Listener) handleConn(conn *net.Conn) {
 	pktBuffer := make([]byte, 1024)
 	for {
 		var pktSize int
+		(*conn).SetReadDeadline(time.Now().Add(ConnectionTimeout))
 		pktSize, err = (*conn).Read(pktBuffer)
 		if err != nil {
 			listener.HandleError(fmt.Errorf("failed to read packet: %s", err.Error()))
@@ -141,6 +145,7 @@ func (listener *Listener) handleConn(conn *net.Conn) {
 		if strings.HasSuffix(pkt, crlf) {
 			msgs := strings.Split(strings.TrimSuffix(pkt, crlf), crlf)
 			for _, msg := range msgs {
+				msg := strings.TrimRight(msg, " ")
 				keepAlive := listener.handleMsg(conn, &session, msg)
 				if !keepAlive {
 					return
@@ -196,68 +201,96 @@ func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string
 }
 
 func (listener *Listener) handleCmd(conn *net.Conn, session *session, cmd string) (res response) {
-	cmd = strings.ToUpper(cmd)
 	words := strings.Split(cmd, " ")
 	wordsLen := len(words)
-	if strings.HasPrefix(cmd, prefixHelo) && wordsLen > 1 {
+	verb := strings.ToUpper(words[0])
+	if verb == verbHelo {
+		if wordsLen != 2 {
+			return resInvalidArgNum
+		}
 		domain := words[1]
 		return session.handleHelo(domain)
-	} else if strings.HasPrefix(cmd, prefixEhlo) && wordsLen > 1 {
+	} else if verb == verbEhlo {
 		domain := words[1]
+		if wordsLen != 2 {
+			return resInvalidArgNum
+		}
 		return session.handleEhlo(domain, listener.MaxMsgSize)
-	} else if strings.HasPrefix(cmd, prefixMailFrom) && wordsLen > 1 {
-		cmdArgsMsg := strings.TrimSpace(strings.TrimPrefix(cmd, prefixMailFrom))
-		cmdArgs := strings.Split(cmdArgsMsg, " ")
-		address := cmdArgs[0]
-		return session.handleMailFrom((*conn).RemoteAddr().(*net.TCPAddr).IP, listener.HandleSpf, listener.TlsMode, address)
-	} else if strings.HasPrefix(cmd, prefixRcptTo) && wordsLen > 1 {
-		cmdArgsMsg := strings.TrimSpace(strings.TrimPrefix(cmd, prefixRcptTo))
-		cmdArgs := strings.Split(cmdArgsMsg, " ")
-		address := cmdArgs[0]
-		return session.handleRcptTo(int(listener.MaxRcpts), address)
-	} else if strings.HasPrefix(cmd, prefixData) {
+	} else if verb == verbMail {
+		if !rgxMailFrom.MatchString(cmd) {
+			return resSyntaxError
+		}
+		address := rgxBrktTxt.FindString(cmd)
+		fmt.Println(address)
+		return session.handleMailFrom((*conn).RemoteAddr().(*net.TCPAddr).IP, listener.HandleSpf, listener.TlsMode, address[1:len(address)-1])
+	} else if verb == verbRcpt {
+		if !rgxRcptTo.MatchString(cmd) {
+			return resSyntaxError
+		}
+		address := rgxBrktTxt.FindString(cmd)
+		return session.handleRcptTo(int(listener.MaxRcpts), address[1:len(address)-1])
+	} else if verb == verbData {
+		if wordsLen != 1 {
+			return resInvalidArgNum
+		}
 		return session.handleData()
-	} else if strings.HasPrefix(cmd, prefixQuit) {
+	} else if verb == verbQuit {
+		if wordsLen != 1 {
+			return resInvalidArgNum
+		}
 		return resBye
-	} else if strings.HasPrefix(cmd, prefixRset) {
+	} else if verb == verbRset {
+		if wordsLen != 1 {
+			return resInvalidArgNum
+		}
 		*session = createNewSession()
-		return resOk
-	} else if strings.HasPrefix(cmd, prefixStartTls) {
+		return resRset
+	} else if verb == verbStartTls {
+		if wordsLen != 1 {
+			return resInvalidArgNum
+		}
 		return resTlsUpgrade
-	} else if strings.HasPrefix(cmd, prefixNoop) {
-		return resOk
-	} else if strings.HasPrefix(cmd, prefixVrfy) ||
-		strings.HasPrefix(cmd, prefixTurn) ||
-		strings.HasPrefix(cmd, prefixExpn) ||
-		strings.HasPrefix(cmd, prefixHelp) ||
-		strings.HasPrefix(cmd, prefixSend) ||
-		strings.HasPrefix(cmd, prefixSaml) ||
-		strings.HasPrefix(cmd, prefixTls) ||
-		strings.HasPrefix(cmd, prefixStartSsl) ||
-		strings.HasPrefix(cmd, prefixRelay) ||
-		strings.HasPrefix(cmd, prefixAuth) {
+	} else if verb == verbNoop {
+		if wordsLen != 1 {
+			return resInvalidArgNum
+		}
+		return resNoop
+	} else if verb == verbHelp {
+		return resHelp
+	} else if verb == verbVrfy ||
+		verb == verbExpn {
+		return resNoVrfy
+	} else if verb == verbAuth ||
+		verb == verbTurn {
 		return resNotImplemented
+	} else if verb == verbSend ||
+		verb == verbSaml ||
+		verb == verbSoml ||
+		verb == verbTls ||
+		verb == verbStartSsl ||
+		verb == verbRelay {
+		return resObsolete
 	}
-	return resSyntaxError
+	return resUnknownVerb
 }
 
 func sendRes(conn *net.Conn, res response) (err error) {
 	if len(res.extendedMsgs) != 0 {
 		msgs := append([]string{res.msg}, res.extendedMsgs...)
 		msgsLen := len(msgs)
+		var resMsg string
 		for i, msg := range msgs {
-			var resMsg string
 			if i+1 == msgsLen {
-				resMsg = fmt.Sprintf("%d %s%s", res.statusCode, msg, crlf)
+				resMsg += fmt.Sprintf("%d %s%s", res.statusCode, msg, crlf)
 			} else {
-				resMsg = fmt.Sprintf("%d-%s%s", res.statusCode, msg, crlf)
+				resMsg += fmt.Sprintf("%d-%s%s", res.statusCode, msg, crlf)
 			}
-			_, err = (*conn).Write([]byte(resMsg))
-			if err != nil {
-				return
-			}
-			printTraceLog("%s <- %#v\n", (*conn).RemoteAddr().String(), resMsg)
 		}
+		_, err = (*conn).Write([]byte(resMsg))
+		if err != nil {
+			return
+		}
+		printTraceLog("%s <- %#v\n", (*conn).RemoteAddr().String(), resMsg)
 		return
 	}
 	resMsg := fmt.Sprintf("%d %s%s", res.statusCode, res.msg, crlf)
