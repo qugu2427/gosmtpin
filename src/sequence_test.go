@@ -27,7 +27,7 @@ func TestBasicSequences(t *testing.T) {
 			{"RSET\r\n", "250 SESSION RESET\r\n"},
 			{"EHLO test2\r\n", "250-HELLO\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250 STARTTLS\r\n"},
 			{"MAIL FROM:<bob@colorado.edu>\r\n", "250 OK\r\n"},
-			{"RCPT TO:<alice@colorado.edu>\r\n", "250 OK\r\n"},
+			{"RCPT TO:<alice@colorado.edu>\r\nRCPT TO:<john@colorado.edu>\r\nRCPT TO:<steve@colorado.edu>\r\n", "250 OK\r\n250 OK\r\n250 OK\r\n"},
 			{"DATA\r\nabc\r\n123\r\n.\r\n", "354 START MAIL\r\n250 OK\r\n"},
 			{"QUIT\r\n", "221 GOODBYE\r\n"},
 		},

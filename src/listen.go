@@ -121,83 +121,77 @@ func (listener *Listener) handleConn(conn *net.Conn) {
 	}
 
 	// greet the client
-	err := sendRes(conn, response{
-		statusCode:   codeReady,
-		msg:          listener.Domain + " ESMTP SERVICE READY",
-		extendedMsgs: nil,
-	})
-	if err != nil {
-		listener.HandleError(fmt.Errorf("failed to greet client: %s", err.Error()))
-		return
-	}
+	listener.sendMsg(conn, fmt.Sprintf("%d %s ESMTP SERVICE READY%s", codeReady, listener.Domain, crlf))
 
 	// each packet
 	pktBuffer := make([]byte, 1024)
 	for {
-		var pktSize int
 		(*conn).SetReadDeadline(time.Now().Add(ConnectionTimeout))
-		pktSize, err = (*conn).Read(pktBuffer)
+		pktSize, err := (*conn).Read(pktBuffer)
 		if err != nil {
 			listener.HandleError(fmt.Errorf("failed to read packet: %s", err.Error()))
 			return
 		}
-		pkt := string(pktBuffer[:pktSize])
-		if strings.HasSuffix(pkt, crlf) {
-			msgs := strings.Split(strings.TrimSuffix(pkt, crlf), crlf)
-			for _, msg := range msgs {
-				msg := strings.TrimRight(msg, " ")
-				keepAlive := listener.handleMsg(conn, &session, msg)
-				if !keepAlive {
-					return
-				}
-			}
-		} else {
-			listener.HandleError(fmt.Errorf("packet does not end in crlf"))
-			return
-		}
+		listener.handleMsg(conn, &session, string(pktBuffer[:pktSize]))
 	}
 }
 
-func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string) (keepAlive bool) {
-	var res response
-	printTraceLog("%s -> %#v\n", (*conn).RemoteAddr().String(), msg+crlf)
-	if session.isInBody() {
-		var finished bool
-		finished, res = session.handleBody(listener.MaxMsgSize, msg)
-		if !finished {
-			keepAlive = true
-			return
+func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string) {
+	var resArr []response
+	var resMsg string
+	printTraceLog("%s -> %#v\n", (*conn).RemoteAddr().String(), msg)
+	if strings.HasSuffix(msg, crlf) {
+		cmds := strings.Split(strings.TrimSuffix(msg, crlf), crlf)
+		for _, cmd := range cmds {
+			cmd = strings.TrimRight(cmd, " ")
+			if session.isInBody() {
+				var finished bool
+				finished, res := session.handleBody(listener.MaxMsgSize, cmd)
+				if !finished {
+					continue
+				}
+				resArr = append(resArr, res)
+				listener.HandleMail(&Mail{
+					Helo:       session.helloFrom,
+					SenderIp:   (*conn).RemoteAddr().(*net.TCPAddr).IP,
+					MailFrom:   session.mailFrom,
+					Data:       session.body,
+					Recipients: session.recipients,
+				})
+			} else {
+				res := listener.handleCmd(conn, session, cmd)
+				resArr = append(resArr, res)
+				if res.hasFlag(responseFlagEndConnection) {
+					defer (*conn).Close()
+					break
+				}
+				if res.hasFlag(responseFlagUpgradeToTls) {
+					tlsConn := tls.Server(*conn, listener.TlsConfig)
+					err := tlsConn.Handshake()
+					if err != nil {
+						listener.HandleError(fmt.Errorf("failed starttls handshake: %s", err.Error()))
+						return
+					}
+					*session = createNewSession()
+					*conn = net.Conn(tlsConn)
+				}
+			}
 		}
-		listener.HandleMail(&Mail{
-			Helo:       session.helloFrom,
-			SenderIp:   (*conn).RemoteAddr().(*net.TCPAddr).IP,
-			MailFrom:   session.mailFrom,
-			Data:       session.body,
-			Recipients: session.recipients,
-		})
 	} else {
-		res = listener.handleCmd(conn, session, msg)
+		resArr = []response{resNoEndingCrlf}
 	}
-	err := sendRes(conn, res)
+	for _, res := range resArr {
+		resMsg += res.toMsg(res)
+	}
+	listener.sendMsg(conn, resMsg)
+}
+
+func (listener *Listener) sendMsg(conn *net.Conn, msg string) {
+	_, err := (*conn).Write([]byte(msg))
 	if err != nil {
-		listener.HandleError(fmt.Errorf("failed send response: %s", err.Error()))
-		return
+		listener.HandleError(err)
 	}
-	if !res.hasFlag(responseFlagEndConnection) {
-		keepAlive = true
-		return
-	}
-	if res.hasFlag(responseFlagUpgradeToTls) {
-		tlsConn := tls.Server(*conn, listener.TlsConfig)
-		err = tlsConn.Handshake()
-		if err != nil {
-			listener.HandleError(fmt.Errorf("failed starttls handshake: %s", err.Error()))
-			return
-		}
-		*session = createNewSession()
-		*conn = net.Conn(tlsConn)
-	}
-	return
+	printTraceLog("%s <- %#v\n", (*conn).RemoteAddr().String(), msg)
 }
 
 func (listener *Listener) handleCmd(conn *net.Conn, session *session, cmd string) (res response) {
@@ -221,7 +215,6 @@ func (listener *Listener) handleCmd(conn *net.Conn, session *session, cmd string
 			return resSyntaxError
 		}
 		address := rgxBrktTxt.FindString(cmd)
-		fmt.Println(address)
 		return session.handleMailFrom((*conn).RemoteAddr().(*net.TCPAddr).IP, listener.HandleSpf, listener.TlsMode, address[1:len(address)-1])
 	} else if verb == verbRcpt {
 		if !rgxRcptTo.MatchString(cmd) {
@@ -272,29 +265,4 @@ func (listener *Listener) handleCmd(conn *net.Conn, session *session, cmd string
 		return resObsolete
 	}
 	return resUnknownVerb
-}
-
-func sendRes(conn *net.Conn, res response) (err error) {
-	if len(res.extendedMsgs) != 0 {
-		msgs := append([]string{res.msg}, res.extendedMsgs...)
-		msgsLen := len(msgs)
-		var resMsg string
-		for i, msg := range msgs {
-			if i+1 == msgsLen {
-				resMsg += fmt.Sprintf("%d %s%s", res.statusCode, msg, crlf)
-			} else {
-				resMsg += fmt.Sprintf("%d-%s%s", res.statusCode, msg, crlf)
-			}
-		}
-		_, err = (*conn).Write([]byte(resMsg))
-		if err != nil {
-			return
-		}
-		printTraceLog("%s <- %#v\n", (*conn).RemoteAddr().String(), resMsg)
-		return
-	}
-	resMsg := fmt.Sprintf("%d %s%s", res.statusCode, res.msg, crlf)
-	_, err = (*conn).Write([]byte(resMsg))
-	printTraceLog("%s <- %#v\n", (*conn).RemoteAddr().String(), resMsg)
-	return
 }

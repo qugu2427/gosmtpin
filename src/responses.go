@@ -1,5 +1,7 @@
 package smtpin
 
+import "fmt"
+
 const (
 	codeReady            uint16 = 220
 	codeBye              uint16 = 221
@@ -33,6 +35,23 @@ type response struct {
 
 func (r response) hasFlag(flag ResponseFlag) bool {
 	return (r.flags & flag) == flag
+}
+
+func (r response) toMsg(res response) (resMsg string) {
+	if len(res.extendedMsgs) != 0 {
+		msgs := append([]string{res.msg}, res.extendedMsgs...)
+		msgsLen := len(msgs)
+		for i, msg := range msgs {
+			if i+1 == msgsLen {
+				resMsg += fmt.Sprintf("%d %s%s", res.statusCode, msg, crlf)
+			} else {
+				resMsg += fmt.Sprintf("%d-%s%s", res.statusCode, msg, crlf)
+			}
+		}
+		return
+	}
+	resMsg = fmt.Sprintf("%d %s%s", res.statusCode, res.msg, crlf)
+	return
 }
 
 var (
@@ -88,6 +107,12 @@ var (
 		0,
 		codeSyntaxErr,
 		"SYNTAX ERROR - INVALID ADDRESS",
+		nil,
+	}
+	resNoEndingCrlf = response{
+		0,
+		codeSyntaxErr,
+		"SYNTAX ERROR - NO ENDING CRLF",
 		nil,
 	}
 	resNotImplemented = response{
