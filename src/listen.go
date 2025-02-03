@@ -132,11 +132,14 @@ func (listener *Listener) handleConn(conn *net.Conn) {
 			listener.HandleError(fmt.Errorf("failed to read packet: %s", err.Error()))
 			return
 		}
-		listener.handleMsg(conn, &session, string(pktBuffer[:pktSize]))
+		endConn := listener.handleMsg(conn, &session, string(pktBuffer[:pktSize]))
+		if endConn {
+			break
+		}
 	}
 }
 
-func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string) {
+func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string) (endConn bool) {
 	var resArr []response
 	var resMsg string
 	printTraceLog("%s -> %#v\n", (*conn).RemoteAddr().String(), msg)
@@ -162,7 +165,7 @@ func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string
 				res := listener.handleCmd(conn, session, cmd)
 				resArr = append(resArr, res)
 				if res.hasFlag(responseFlagEndConnection) {
-					defer (*conn).Close()
+					endConn = true
 					break
 				}
 				if res.hasFlag(responseFlagUpgradeToTls) {
@@ -184,6 +187,7 @@ func (listener *Listener) handleMsg(conn *net.Conn, session *session, msg string
 		resMsg += res.toMsg(res)
 	}
 	listener.sendMsg(conn, resMsg)
+	return
 }
 
 func (listener *Listener) sendMsg(conn *net.Conn, msg string) {

@@ -35,23 +35,6 @@ type session struct {
 	body       string
 }
 
-func (s0 session) equals(s1 session) bool {
-	if len(s0.recipients) != len(s1.recipients) {
-		return false
-	}
-
-	for i, s0Rcpt := range s0.recipients {
-		if s0Rcpt != s1.recipients[i] {
-			return false
-		}
-	}
-
-	return s0.flags == s1.flags &&
-		s0.helloFrom == s1.helloFrom &&
-		s0.mailFrom == s1.mailFrom &&
-		s0.body == s1.body
-}
-
 func createNewSession() session {
 	return session{
 		0,
